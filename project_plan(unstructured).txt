@@ -1,0 +1,460 @@
+﻿
+# 1) The 9 CSVs — filenames + columns + quick examples
+
+(Exact column names are the standard Olist ones. Types shown as: string / int / float / datetime.)
+
+1. **`olist_customers_dataset.csv`**
+
+   * `customer_id` (str) — unique order-customer mapping, e.g. `c1f...`
+   * `customer_unique_id` (str) — real user id across orders, e.g. `u12345`
+   * `customer_zip_code_prefix` (int) — 5-digit prefix, e.g. `01001`
+   * `customer_city` (str) — `São Paulo`
+   * `customer_state` (str) — `SP`
+     *Use:* join to orders for user-level aggregates (repeat rate, recency).
+
+2. **`olist_orders_dataset.csv`**
+
+   * `order_id` (str) — e.g. `order_000`
+   * `customer_id` (str) — FK → customers.customer\_id
+   * `order_status` (str) — e.g. `delivered`, `shipped`, `canceled`, `invoiced`, `processing`, `unavailable`
+   * `order_purchase_timestamp` (datetime) — when bought
+   * `order_approved_at` (datetime / nullable) — payment approval time
+   * `order_delivered_carrier_date` (datetime / nullable) — carrier pickup
+   * `order_delivered_customer_date` (datetime / nullable) — delivered to customer
+   * `order_estimated_delivery_date` (datetime)
+     *Use:* base timeline, delivery latency, cancellations, cohorting.
+
+3. **`olist_order_items_dataset.csv`**
+
+   * `order_id` (str)
+   * `order_item_id` (int) — position in order (1..n)
+   * `product_id` (str)
+   * `seller_id` (str)
+   * `shipping_limit_date` (datetime) — latest ship-by
+   * `price` (float) — item price
+   * `freight_value` (float) — shipping price
+     *Use:* item-level GMV, bundle analysis, price distribution, freight impact.
+
+4. **`olist_order_payments_dataset.csv`**
+
+   * `order_id` (str)
+   * `payment_sequential` (int) — multiple rows per order if multi-pay
+   * `payment_type` (str) — `boleto`, `credit_card`, `voucher`, `debit_card` etc.
+   * `payment_installments` (int)
+   * `payment_value` (float)
+     *Use:* revenue, payment-method effect on churn/returns.
+
+5. **`olist_order_reviews_dataset.csv`**
+
+   * `review_id` (str)
+   * `order_id` (str)
+   * `review_score` (int 1..5)
+   * `review_comment_title` (str / nullable)
+   * `review_comment_message` (str / nullable)
+   * `review_creation_date` (datetime)
+   * `review_answer_timestamp` (datetime / nullable) — seller response time
+     *Use:* CS signals, NPS proxy, topic modeling, quality feedback.
+
+6. **`olist_products_dataset.csv`**
+
+   * `product_id` (str)
+   * `product_category_name` (str) — raw category name (Portuguese)
+   * `product_name_lenght` (int) — name length
+   * `product_description_lenght` (int) — desc length
+   * `product_photos_qty` (int)
+   * `product_weight_g` (float)
+   * `product_length_cm`, `product_height_cm`, `product_width_cm` (floats)
+     *Use:* size/weight → freight; category-level pricing & return risk.
+
+7. **`product_category_name_translation.csv`**
+
+   * `product_category_name` (str) — raw
+   * `product_category_name_english` (str) — normalized
+     *Use:* normalize categories for dashboard & analysis.
+
+8. **`olist_sellers_dataset.csv`**
+
+   * `seller_id` (str)
+   * `seller_zip_code_prefix` (int)
+   * `seller_city` (str)
+   * `seller_state` (str)
+     *Use:* seller performance, regional fulfillment.
+
+9. **`olist_geolocation_dataset.csv`**
+
+   * `geolocation_zip_code_prefix` (int)
+   * `geolocation_lat` (float)
+   * `geolocation_lng` (float)
+   * `geolocation_city` (str)
+   * `geolocation_state` (str)
+     *Use:* map customers/sellers to lat/long → heatmaps, distance calc.
+
+---
+
+# 2) Quick data-profiling checklist (what to run first)
+
+Copy these SQL/Pandas checks and run them immediately.
+
+SQL / pandas checks:
+
+* Row counts per file. (`SELECT COUNT(*) FROM ...`)
+* Unique key checks: customers (customer\_id, customer\_unique\_id), orders (order\_id), products (product\_id).
+* Referencial integrity: orders.customer\_id ∈ customers, items.order\_id ∈ orders, items.product\_id ∈ products, sellers.seller\_id ∈ sellers.
+* Null counts per column and % of nulls.
+* Distinct value counts for categorical fields (order\_status, payment\_type, product\_category\_name).
+* Min/max dates for timestamps; check future dates or impossible values.
+* Price/freight negative or zero checks.
+* Range checks: review\_score ∈ \[1,5], product\_photos\_qty >=0.
+* Distribution plots for price/freight and item weights (log-scale if skewed).
+
+Run these as your first sanity gate. If any check fails loudly (e.g., >5% bad foreign keys), stop and investigate — we’ll add fixes below.
+
+---
+
+# 3) File-by-file cleaning & need-to-know issues (practical actions)
+
+### `customers`
+
+* Normalize `customer_zip_code_prefix` to 5-digit string; left-pad zeros where needed.
+* Collapse `customer_unique_id` duplicates: same unique\_id should map to same person across many orders. Build `customer_dim` keyed by `customer_unique_id`.
+* Check inconsistent city/state spellings.
+
+### `orders`
+
+* Parse timestamps to UTC-aware datetimes (or localz to BRT).
+* Create delivery\_delay = `order_delivered_customer_date - order_delivered_carrier_date` and delivery\_total\_time = `order_delivered_customer_date - order_purchase_timestamp`. Mark negative durations as data errors.
+* Flag cancellations: `order_status IN ('canceled','unavailable')` — treat these as failed conversions (exclude from revenue unless payment exists).
+
+### `order_items`
+
+* Convert `price` and `freight_value` to floats. Aggregate price \* quantity (although quantity is implicit by multiple order\_item rows). Detect clearly wrong prices (0 or negative).
+* shipping\_limit\_date: compute shipping\_delay = `shipping_limit_date - order_purchase_timestamp`.
+
+### `payments`
+
+* Some orders have multiple payment rows. Validate sum(payment\_value) ≈ item\_total + freight\_total. Create `payment_coverage = SUM(payment_value) / order_total`. If <0.95 or >1.05, flag for manual check.
+
+### `reviews`
+
+* Heavy nulls in `review_comment_message` are normal. Extract review length, presence/absence. Standardize dates. Compute `response_time = review_answer_timestamp - review_creation_date`.
+* Very important: map reviews to `product_id` via orders→order\_items join. Some reviews are for order-level, not product-level.
+
+### `products`
+
+* Use `product_category_name_translation` to add English category. Normalize numeric dims; calculate volume cm³ and density = weight\_g / volume. Flag outliers (density extremely large → bad data).
+
+### `sellers`
+
+* Map seller zip prefix → seller lat/lng via geolocation table (take median lat/lng).
+
+### `geolocation`
+
+* Many duplicates for zip prefix; aggregate lat/lng median per prefix for stable coordinates. Drop impossible lat/lng.
+
+---
+
+# 4) Canonical schema (what we’ll build in the DB)
+
+Make these views/tables (names and purpose):
+
+* `dim_customers` — consolidated by `customer_unique_id`: first\_order\_date, last\_order\_date, total\_orders, total\_spend, customer\_state, customer\_city.
+* `dim_products` — product metadata + category\_english, dimensions, weight, density, avg\_price, avg\_review\_score.
+* `dim_sellers` — seller-level aggregate: avg\_ship\_time, avg\_fulfillment\_delay, total\_items\_sold.
+* `fact_orders` — 1 row per order: order\_id, customer\_unique\_id, order\_date, order\_status, items\_count, order\_total, freight\_total, payment\_type\_major, delivered\_date, delivery\_days.
+* `fact_order_items` — item rows with product\_id, seller\_id, price, freight\_value.
+* `customer_month_features` — partitioned by month for feature store (recency, frequency in last 30/90/180 days, avg\_order\_value, avg\_delivery\_delay, complaints\_count, avg\_review\_score).
+* `product_agg` and `seller_agg` feature tables.
+
+---
+
+# 5) Exact SQL to build the main `orders_clean` view (starter)
+
+Use this as your first robust view. Replace `raw.` with your actual schema.
+
+```sql
+-- sql/orders_clean_view.sql
+CREATE OR REPLACE VIEW analytics.orders_clean AS
+SELECT
+  o.order_id,
+  o.customer_id,
+  c.customer_unique_id,
+  o.order_status,
+  o.order_purchase_timestamp,
+  o.order_approved_at,
+  o.order_delivered_carrier_date,
+  o.order_delivered_customer_date,
+  o.order_estimated_delivery_date,
+  DATE(o.order_purchase_timestamp) AS order_date,
+  -- aggregated item-level metrics
+  SUM(oi.price) AS items_value,
+  SUM(oi.freight_value) AS freight_value,
+  COUNT(DISTINCT oi.order_item_id) AS items_count,
+  SUM(oi.price) + SUM(oi.freight_value) AS order_total,
+  MIN(p.product_category_name_english) AS primary_category,
+  -- delivery metrics
+  DATEDIFF(day, o.order_purchase_timestamp, o.order_delivered_customer_date) AS days_to_delivery,
+  DATEDIFF(day, o.order_delivered_carrier_date, o.order_delivered_customer_date) AS delivery_carrier_to_customer_days
+FROM raw.olist_orders_dataset o
+JOIN raw.olist_order_items_dataset oi USING (order_id)
+LEFT JOIN raw.olist_customers_dataset c USING (customer_id)
+LEFT JOIN raw.olist_products_dataset p USING (product_id)
+GROUP BY
+  o.order_id, o.customer_id, c.customer_unique_id,
+  o.order_status, o.order_purchase_timestamp, o.order_approved_at,
+  o.order_delivered_carrier_date, o.order_delivered_customer_date,
+  o.order_estimated_delivery_date;
+```
+
+(Adapt `DATEDIFF` syntax to your SQL engine — this is generic.)
+
+---
+
+# 6) Feature ideas (customer/product/seller/order) — quick list to implement
+
+**Customer features (time-windowed)**
+
+* recency\_days (since last order), frequency\_30/90/180, monetary\_30/90/180, avg\_order\_value, lifetime\_orders, days\_between\_orders\_median, first\_order\_date, last\_order\_date, repeat\_rate (orders > 1), refund\_rate (if inferable).
+
+**Product features**
+
+* avg\_price, price\_std, avg\_review\_score, photos\_qty, avg\_return\_rate (inferred from cancellations), avg\_freight\_price, sales\_per\_month, product\_age\_days.
+
+**Seller features**
+
+* avg\_fulfillment\_time, avg\_delivery\_time, percent\_on\_time\_shipping, refund\_ratio.
+
+**Order features**
+
+* order\_total, items\_count, price\_per\_item, total\_freight\_share, is\_high\_value (top 5%), delivery\_delay\_days, time\_of\_day, day\_of\_week.
+
+Make feature names consistent and store as `customer_features_v1 (date, customer_id, features...)` partitioned by month.
+
+---
+
+# 7) Analysis plan (phase by phase)
+
+Do the project in phases — ship each phase as a deliverable.
+
+**Phase 0 — Munging & Data Quality (deliverable: `notebooks/0_data_profile.ipynb`)**
+
+* Run all profiling checks. Produce `data_profile.html` (pandas-profiling or sweetviz).
+* Build `orders_clean` view and a `feature_store` skeleton.
+* Deliverable: `sql/` scripts + profile report.
+
+**Phase 1 — Core KPIs + Dashboard (deliverable: `dashboard/Overview`)**
+
+* KPIs: Total GMV, Avg Order Value (AOV), Orders/day, Repeat Rate, Avg Delivery Time, NPS proxy (avg review score).
+* Visuals: KPI bar, time-series GMV, repeat rate trend, top categories, regional heatmap (choropleth by state).
+* Deliverable: Tableau / PowerBI workbook + 30–60s GIF.
+
+**Phase 2 — Customer segmentation (RFM) & CLTV**
+
+* Compute RFM, cluster (KMeans), map clusters → marketing playbooks.
+* Fit BG/NBD + Gamma-Gamma for CLTV per customer.
+* Deliverable: notebook + `results/cltv_table.csv` + segment dashboard.
+
+**Phase 3 — Funnel & Churn / Retention Playbook**
+
+* Build funnel (orders → repeat customers). Identify drop-off points.
+* Build simple churn model (for repeat behavior) or retention rules. Simulate targeted campaign ROI (assume X% conversion uplift).
+* Deliverable: `playbook.pdf` + sample SQL to extract campaign list.
+
+**Phase 4 — Reviews (NLP) & Seller Quality**
+
+* Clean reviews, basic sentiment (VADER) → map sentiment to product/seller. Topic modeling for top negative themes.
+* Link negative theme to refunds/delivery delays.
+* Deliverable: `notebooks/reviews_nlp.ipynb`, wordclouds, topics table.
+
+**Phase 5 — Geospatial & Ops**
+
+* Demand heatmaps by city/state, identify underserved regions (supply vs demand). Suggest reallocation or freight-pricing changes.
+* Deliverable: map visual, one-page ops memo.
+
+**Phase 6 — Final report + demo**
+
+* Combine all deliverables: README, 3-minute video + GIFs, one-pager KPI impact, code tidy. Publish repo.
+
+---
+
+# 8) Dashboard wireframe (what to show — copy into Tableau/PowerBI)
+
+**Overview tab**
+
+* Top KPIs (GMV, Orders, Repeat Rate, AOV, Avg Delivery Days, Avg Review Score).
+* Monthly GMV trend (line + forecast optional).
+* Top 10 categories by revenue (horizontal bar).
+* Map: Revenue density by state (choropleth).
+
+**Customer tab**
+
+* RFM clusters (bar + table).
+* CLTV distribution (histogram) + top 100 customers list.
+* Retention curve by cohort.
+
+**Product / Seller tab**
+
+* Top products by GMV and margin.
+* Seller performance scatter: avg\_delivery\_time vs avg\_review\_score.
+* Reviews sentiment heatmap by category.
+
+**Ops / Geo tab**
+
+* City-level heatmap for orders and average delivery days.
+* Suggested dispatch reassignments & shipping-cost impact simulation.
+
+Keep interactivity: filters (date range, state, category, payment\_type).
+
+---
+
+# 9) Exact deliverables & repo structure (copy-paste)
+
+```
+olist-project/
+├─ README.md
+├─ data/
+│  └─ sample/ (small CSV extracts) + link to full Kaggle dataset
+├─ notebooks/
+│  ├─ 0_data_profile.ipynb
+│  ├─ 1_etl_orders_clean.ipynb
+│  ├─ 2_rfm_cltv.ipynb
+│  ├─ 3_reviews_nlp.ipynb
+│  └─ 4_geospatial_ops.ipynb
+├─ sql/
+│  ├─ create_views.sql
+│  ├─ feature_store.sql
+│  └─ label_campaigns.sql
+├─ src/
+│  ├─ etl.py
+│  ├─ features.py
+│  └─ model.py
+├─ dashboard/
+│  └─ tableau_workbook.twbx (or pbix) + screenshots/
+├─ results/
+│  ├─ cltv_top_customers.csv
+│  └─ one_pager.pdf
+└─ demo/
+   ├─ demo_gif.gif
+   └─ demo_video.mp4
+```
+
+---
+
+# 10) Starter code snips (Python + SQL) — copy/paste friendly
+
+Python: load files & sample checks
+
+```python
+# notebooks/1_etl_orders_clean.ipynb (cells)
+import pandas as pd
+from pathlib import Path
+
+DATA_DIR = Path("data/raw")
+orders = pd.read_csv(DATA_DIR/"olist_orders_dataset.csv", parse_dates=['order_purchase_timestamp',
+                                                                     'order_approved_at',
+                                                                     'order_delivered_carrier_date',
+                                                                     'order_delivered_customer_date',
+                                                                     'order_estimated_delivery_date'])
+items  = pd.read_csv(DATA_DIR/"olist_order_items_dataset.csv", parse_dates=['shipping_limit_date'])
+customers = pd.read_csv(DATA_DIR/"olist_customers_dataset.csv")
+products = pd.read_csv(DATA_DIR/"olist_products_dataset.csv")
+payments = pd.read_csv(DATA_DIR/"olist_order_payments_dataset.csv")
+reviews = pd.read_csv(DATA_DIR/"olist_order_reviews_dataset.csv", parse_dates=['review_creation_date','review_answer_timestamp'])
+sellers = pd.read_csv(DATA_DIR/"olist_sellers_dataset.csv")
+geo = pd.read_csv(DATA_DIR/"olist_geolocation_dataset.csv")
+print('rows:', len(orders), len(items), len(customers))
+# quick null check
+for df, name in [(orders,'orders'),(items,'items'),(customers,'customers')]:
+    print(name, df.isnull().mean().sort_values(ascending=False).head(5))
+```
+
+SQL: RFM base (Postgres-ish)
+
+```sql
+-- sql/rfm.sql
+WITH last_order AS (
+  SELECT customer_unique_id, MAX(order_purchase_timestamp)::date AS last_order_date
+  FROM raw.orders_clean
+  GROUP BY 1
+), rec AS (
+  SELECT
+    fc.customer_unique_id,
+    DATE_PART('day', current_date - MAX(fc.order_date)) AS recency_days,
+    COUNT(DISTINCT fc.order_id) AS frequency,
+    SUM(fc.order_total) AS monetary
+  FROM analytics.orders_clean fc
+  GROUP BY 1
+)
+SELECT r.*, l.last_order_date
+FROM rec r
+LEFT JOIN last_order l USING(customer_unique_id);
+```
+
+Feature-store partition creation (example)
+
+```sql
+CREATE TABLE IF NOT EXISTS analytics.customer_month_features (
+  feature_month DATE,
+  customer_unique_id TEXT,
+  recency_days INT,
+  frequency_30 INT,
+  frequency_90 INT,
+  monetary_90 FLOAT,
+  avg_delivery_delay FLOAT,
+  PRIMARY KEY (feature_month, customer_unique_id)
+) PARTITION BY RANGE (feature_month);
+```
+
+---
+
+# 11) Tests & data-quality rules to enforce (automate these)
+
+* Referential integrity job daily — report missing FK ratios.
+* Price sanity: percent of items with price<=0 must be <1%.
+* Delivery date sanity: percent with negative delivery days = 0.
+* Review to order mapping completeness: % reviews with missing order\_id = 0.
+* Payment coverage: % orders where SUM(payment\_value) within ±5% of order\_total.
+  Failing thresholds create GitHub issues automatically (if using CI).
+
+---
+
+# 12) KPIs & one-pager metrics to compute (the 3 lines recruiters want)
+
+* **Total GMV (period)**, **AOV**, **Repeat Purchase Rate** (customers with ≥2 orders / total customers).
+* **Avg Delivery Time** and **% on-time deliveries** vs SLA.
+* **Top 10 categories** share of GMV and **category-level avg review\_score**.
+
+One-pager message: “Prioritized top 10% at-risk repeat customers with targeted promo → expected +X% repeat rate, estimated incremental revenue ₹Y/month (assumptions detailed).”
+
+---
+
+# 13) Performance & infra suggestions (practical)
+
+* Local dev: SQLite / DuckDB for fast single-machine joins. DuckDB is perfect for notebooks and big CSVs.
+* For real production: BigQuery (if cloud) or Postgres + partitioning.
+* Use `parquet` for intermediate tables (faster IO).
+* Orchestrate with simple `Makefile` or `Airflow` if you want scheduled feature updates.
+
+---
+
+# 14) Timeline & MVP (deliverable-focused)
+
+You asked for a full-proof plan — here’s a micro-MVP you can finish fast, then iterate:
+
+MVP (ship in 3 commits):
+
+1. Ingest + `orders_clean` view + data profile report.
+2. Dashboard Overview (KPI + monthly GMV + top categories + map screenshot).
+3. RFM segments + small CLTV table + one-pager.
+
+Then add NLP, geospatial ops, deep CLTV in next iterations.
+
+---
+
+# 15) Final checklist before publishing
+
+* Remove raw PII (if any) or sample small subset in repo and provide download link to full dataset (Kaggle terms).
+* Add `README.md` with problem, approach, results, how to run.
+* Include a short 2–3 min demo video: show dashboard -> one key model (CLTV) -> playbook.
+* Add `CONTRIBUTING.md` and `requirements.txt` (python packages pinned).
+
+---
